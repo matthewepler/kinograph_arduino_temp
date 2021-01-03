@@ -5,165 +5,187 @@
    Matthew Epler, 2020
 
    RIGHTS GO HERE
+
+   TODO
+   ----
+   - calibration mode (see DueFlashStorage lib examples)
+     - check EEPROM
+     - blink if empty ("CLBT" "LEFT")
+     - on move, display values
+     - 3x on each switch
+     - blink "CLBT RIGHT"
+     - repeat
+     - "ALL" "SET!"
+     - set targets at equal %
+     
+    - If limit switch is hit and engage switch is up,
+      don't restart startup automatically. Blink error and 
+      require toggle to clear state and re-start startup routine. 
  ********************************************************/
 
 #include "defaults.h"
 
-
-void setup()
-{
+void setup() {
   Serial.begin(9600);
  
-  // Initialize limit switches
+  // Init limit switches
   pinMode(hubLeft_minSwitchPin, INPUT_PULLUP);
   pinMode(hubLeft_maxSwitchPin, INPUT_PULLUP);
-//  attachInterrupt(digitalPinToInterrupt(hubLeft_minSwitchPin), handleEngagedInterrupt, LOW);
-//  attachInterrupt(digitalPinToInterrupt(hubLeft_maxSwitchPin), killAllNow, LOW);
   pinMode(hubRight_minSwitchPin, INPUT_PULLUP);
   pinMode(hubRight_maxSwitchPin, INPUT_PULLUP);
-//  attachInterrupt(digitalPinToInterrupt(hubRight_minSwitchPin), handleEngagedInterrupt, LOW);
-//  attachInterrupt(digitalPinToInterrupt(hubRight_maxSwitchPin), killAllNow, LOW);
 
-  // Initialize supply (left) motor
+  // Init supply (left) motor
   pinMode(hubLeft_potPin, INPUT);
   pinMode(motorLeft_pwm, OUTPUT);
   pinMode(motorLeft_dir, OUTPUT);
   digitalWrite(motorLeft_dir, LOW);
 
-  // Initialize takeup (right) motor
+  // Init takeup (right) motor
   pinMode(hubRight_potPin, INPUT);
   pinMode(motorRight_pwm, OUTPUT);
   pinMode(motorRight_dir, OUTPUT);
   digitalWrite(motorRight_dir, HIGH); // HIGH == counter-clockwise
-
-  // initialize PID variables
-  PIDLeft_target = hubLeft_targetPotValue;
-  PIDRight_target = hubRight_targetPotValue;
-
-  // default PIDs to "off"
-  PIDLeft.SetMode(MANUAL);
-  PIDRight.SetMode(MANUAL);
-
-  // Dashboard Hardware & Control
-  pinMode(control_goSwitchPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(control_goSwitchPin), killAllNow, RISING);
+ 
+  // Init Control Panel
+  pinMode(control_scanningSwitchPin, INPUT_PULLUP);
+  attachInterrupt(control_scanningSwitchPin, readControls, CHANGE);
+  num_display.blinkRate(0);
   num_display.begin(0x70);
+
+  killAllNow();
 }
 
 void loop() {
-  // --- debugging printers ---
 //  printLimitSwitchValues();
-  printHubValues();
+//  printHubValues();
 //  printPIDValues();
 //  printControlPanelValues();
 
-  updateMachineStatus();
-  updateTension();
-  updateSpeed();
+  // if the scanning switch is ON...
+  if (scanning) { 
+    if (!startup) startUp();
+    updateTension();
+  } else {
+    killAllNow();
+  }
 }
 
 void updateTension() {
+  readHubs();
   
-  
-  hubLeft_potVal = analogRead(hubLeft_potPin);
-  hubRight_potVal = analogRead(hubRight_potPin);
+  PIDLeft_input = (int) map(hubLeft_potVal, hubLeft_potMinVal, hubLeft_potMaxVal, 0, 100);
+  PIDRight_input = (int) map(hubRight_potVal, hubRight_potMaxVal, hubRight_potMinVal, 100, 0);
 
-  PIDLeft_input = hubLeft_potVal;
-  PIDRight_input = hubRight_potVal;
-
+  // target is set in default settings, and reset by initPIDs() (which is called startUp and killAllNow).
   PIDLeft.Compute();
-  PIDRight.Compute();
+  PIDRight.Compute();                               
 
-  if (!PIDsRunning || !startup) return; // refactor
-  analogWrite(motorLeft_pwm, PIDLeft_output);
-  analogWrite(motorRight_pwm, PIDRight_output);
+//  Serial.print("PIDRight_output");
+//  Serial.println(PIDRight_output);
+//  Serial.print("PIDLeft_output");
+//  Serial.println(PIDLeft_output);
+//  Serial.println();
+  
+  analogWrite(motorLeft_pwm, constrain(PIDLeft_output, 0, 100));
+  analogWrite(motorRight_pwm, constrain(PIDRight_output, 0, 100));
 }
 
-void updateSpeed() {  
-  // this is all temp until we get fps 
-  
-  control_potVal = analogRead(control_potPin);
-  int _speed = int(map(control_potVal, 0, 1023, 0, 150));
-
-  num_display.print(_speed);
-  num_display.writeDisplay();
-
-  if (!PIDsRunning || !startup) return; // refactor
-  analogWrite(motorRight_pwm, _speed);
-}
-
-void updateMachineStatus() {
-  
-  readHubSwitches();
-  readGoSwitch();
-
-  if (!machineOn) {
-    killAllNow();
-  }
-  
-  if (machineOn && !startup) {
-    killAllNow();
-    startUp();
-  }
-}
-
-void readHubSwitches() {
-  
+void readHubs() {
   hubLeft_minSwitchVal = digitalRead(hubLeft_minSwitchPin);
   hubLeft_maxSwitchVal = digitalRead(hubLeft_maxSwitchPin);
   hubRight_minSwitchVal = digitalRead(hubRight_minSwitchPin);
   hubRight_maxSwitchVal = digitalRead(hubRight_maxSwitchPin);
+
+  int noTension = hubRight_minSwitchVal == LOW || hubLeft_minSwitchVal == LOW;
+  int tensionMax = hubRight_maxSwitchVal == LOW || hubLeft_maxSwitchVal == LOW;
+  
+  if (startup && noTension) {
+    alert("WOAH. We lost tension!", true);
+    return;
+  } 
+ 
+  if (startup && tensionMax) {
+    alert("WOAH. Max tension reached!", true);
+    return;
+  }
+  
+  hubLeft_potVal = analogRead(hubLeft_potPin);
+  hubRight_potVal = analogRead(hubRight_potPin);
 }
 
-
-void readGoSwitch() {
-  machineOn = digitalRead(control_goSwitchPin);
-}
-
-void handleEngagedInterrupt() {
-  if (startup) {
-    startup = false;
-    killAllNow();
+void readControls() {
+  scanning = digitalRead(control_scanningSwitchPin) == HIGH ? true : false;
+  
+  // the switch has been toggled, release the hold so we can try startup again. 
+  if (scanning && holding) {
+    holding = false;
   }
 }
 
 void startUp() {
-  Serial.println("starting up...");
-  if (!hubLeft_maxSwitchPin || !hubRight_maxSwitchPin) return;
-
-  float l_startupSpeed = 0;
-  float r_startupSpeed = 0;
+  alert("Starting up...", false);
   
-  while (hubLeft_minSwitchVal == LOW || hubRight_minSwitchVal == LOW) {
-        
-    if (!machineOn) break;
-    readHubSwitches();
-    readGoSwitch();
+  num_display.print(00.00);
+  num_display.blinkRate(1);
+  num_display.writeDisplay();
 
-    if (hubLeft_minSwitchVal == LOW) {
-      analogWrite(motorLeft_pwm, l_startupSpeed);
-      l_startupSpeed += 0.01;
+  initPIDs();
+
+  boolean leftReady = false;
+  boolean rightReady = false;
+
+  while (!leftReady || !rightReady) {
+ 
+    if (!scanning) {
+      alert("Startup interrupted. Someone flipped the switch.", true);
+      num_display.blinkRate(0);
+      return;
     }
-    if (hubRight_minSwitchVal == LOW) {
-      analogWrite(motorRight_pwm, r_startupSpeed);
-      r_startupSpeed += 0.01;
+
+    readHubs();
+    
+    if (!leftReady && PIDLeft_target < hubLeft_targetPotValue) {
+      PIDLeft_target += 0.1;
+    } else {
+      leftReady = true;
     }
+    
+    if (!rightReady && PIDRight_target < hubRight_targetPotValue) {
+      PIDRight_target += 0.1;
+    } else {
+      rightReady = true;
+    }
+
+    updateTension();
   }
   
-  startup = true;
-  initPIDs();
+  if (hubLeft_minSwitchVal == HIGH && hubRight_minSwitchVal == HIGH) {
+    startup = true;
+    num_display.blinkRate(0);
+  } else {
+    alert("Startup complete but the hub reports a limit switch is still closed.", false);
+    // let's hold off on trying to startup right away. Force user to toggle switch.
+    holding = true;
+  }
 }
 
 void killAllNow() {
+  scanning = false;
   startup = false;
-  PIDsRunning = false;
+  initPIDs();
   killMotors();
+  holding = true;
 }
 
 void initPIDs() {
   PIDLeft.SetMode(AUTOMATIC);
   PIDRight.SetMode(AUTOMATIC);
-  PIDsRunning = true;
+  PIDLeft_output = 0;
+  PIDRight_output = 0;
+  PIDLeft_input = 0;
+  PIDRight_input = 0;
+  PIDLeft_target = 0;
+  PIDRight_target = 0;
 }
 
 void killMotors() {
@@ -171,10 +193,18 @@ void killMotors() {
   analogWrite(motorRight_pwm, 0);
 }
 
+void alert(String message, boolean kill) {
+  Serial.print(message);
+  if (kill) killAllNow();
+}
+
 
 // ---------------- HELPER + DEBUGGING FUNCTIONS -----------------
 
 void printLimitSwitchValues() {
+  Serial.println();
+  Serial.println("LIMIT SWITCH VALUES");
+  Serial.println("====================");
   Serial.print(hubLeft_minSwitchVal);  // 0 at rest
   Serial.print(" ");
   Serial.print(hubLeft_maxSwitchVal);  // 1 at rest
@@ -186,6 +216,9 @@ void printLimitSwitchValues() {
 }
 
 void printHubValues() {
+  Serial.println();
+  Serial.println("HUB VALUES");
+  Serial.println("====================");
   Serial.print(analogRead(hubLeft_potPin));
   Serial.print(" : " );
   Serial.print(analogRead(hubRight_potPin));
@@ -193,27 +226,29 @@ void printHubValues() {
 }
 
 void printPIDValues() {
+  Serial.println();
+  Serial.print("PID VALUES (L:R)(input, target, output) => ");
   Serial.print(PIDLeft_input);
   Serial.print(" ");
   Serial.print(PIDLeft_target);
   Serial.print(" ");
   Serial.print(PIDLeft_output);
-
-  Serial.print(" ");
-
+  Serial.print(" : ");
   Serial.print(PIDRight_input);
   Serial.print(" ");
   Serial.print(PIDRight_target);
   Serial.print(" ");
   Serial.print(PIDRight_output);
-
   Serial.println();
 }
 
 void printControlPanelValues() {
+  Serial.println();
+  Serial.println("CONTROL PANEL VALUES");
+  Serial.println("====================");
   Serial.print("pot: ");
   Serial.print(analogRead(control_potPin));
   Serial.print("\t goSwitch:");
-  Serial.print(digitalRead(control_goSwitchPin));
+  Serial.print(digitalRead(control_scanningSwitchPin));
   Serial.println();
 }
